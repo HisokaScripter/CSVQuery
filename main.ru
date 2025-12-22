@@ -1,25 +1,3 @@
-//! Minimal Rust CLI equivalent of the PowerShell CSV combiner.
-//! Features:
-//! - Input folder, recursive file discovery with multiple glob patterns (`;` or `,` separated).
-//! - Plain filter language: `Column contains foo AND * contains 20,21,22-25` with operators
-//!   contains / does not contain / = / != / > / < / >= / <=, AND/OR, `*` column for any column.
-//!   Values support comma lists and numeric ranges (e.g., `19-23` expands to 19,20,21,22,23).
-//! - Unifies columns across files; missing columns are padded with "".
-//! - Streams rows; writes header once and appends rows as they are processed.
-//! - Parallel file processing can be added with rayon; this version keeps it simple/streaming
-//!   and should already outperform the PowerShell implementation.
-//!
-//! Build/run (once Rust is installed):
-//!   cargo new csvcombiner
-//!   cd csvcombiner
-//!   # replace src/main.rs with this file’s contents
-//!   # add to Cargo.toml dependencies (under [dependencies]):
-//!   # csv = "1.3"
-//!   # globset = "0.4"
-//!   # walkdir = "2"
-//!   # clap = { version = "4", features = ["derive"] }
-//!   cargo run --release -- --input C:\path\to\folder --output C:\out.csv --patterns "*.csv;*MFT*.csv" --filter "* contains 2025 AND * contains 11 AND * contains 19-23"
-
 use clap::Parser;
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -33,322 +11,348 @@ use std::thread;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Op {
+enum Operator {
     Contains,
     NotContains,
-    Eq,
-    Ne,
-    Gt,
-    Lt,
-    Ge,
-    Le,
+    Equal,
+    NotEqual,
+    GreaterThan,
+    LessThan,
+    GreaterEqual,
+    LessEqual,
 }
 
 #[derive(Debug, Clone)]
 struct Condition {
     column: String,
-    op: Op,
-    values: Vec<String>, // expanded list (ranges expanded)
+    operator: Operator,
+    values: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct Filter {
     conditions: Vec<Condition>,
-    connectors: Vec<String>, // AND / OR, length = conditions.len() - 1
+    connectors: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "CSV Combiner", version)]
-struct Cli {
-    /// Input folder (recursive search)
+struct CliArgs {
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Output file (CSV). If a directory is given, a timestamped CSV is created.
     #[arg(short, long)]
     output: PathBuf,
 
-    /// File patterns separated by ';' or ',' (e.g., "*.csv;*MFT*.csv")
     #[arg(short, long, default_value = "*.csv")]
     patterns: String,
 
-    /// Filter text, e.g., `Status contains Open AND * contains 20,21,22-25`
     #[arg(short, long, default_value = "")]
     filter: String,
 }
 
 fn build_globset(patterns: &str) -> anyhow::Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
-    for pat in patterns
+    for pattern in patterns
         .split(|c| c == ';' || c == ',')
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        builder.add(Glob::new(pat)?);
+        builder.add(Glob::new(pattern)?);
     }
     Ok(builder.build()?)
 }
 
-fn find_files(root: &Path, gs: &GlobSet) -> Vec<PathBuf> {
+fn discover_files(root: &Path, globset: &GlobSet) -> Vec<PathBuf> {
     WalkDir::new(root)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
-        .filter(|e| gs.is_match(e.path()))
+        .filter(|e| globset.is_match(e.path()))
         .map(|e| e.into_path())
         .collect()
 }
 
 fn expand_values(raw: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for part in raw
+    let mut expanded = Vec::new();
+
+    for token in raw
         .split(',')
         .map(|s| s.trim().trim_matches('"').trim_matches('\''))
         .filter(|s| !s.is_empty())
     {
-        if let Some((a, b)) = part.split_once('-') {
-            if let (Ok(start), Ok(end)) = (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
-                let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
-                for v in lo..=hi {
-                    out.push(v.to_string());
+        if let Some((start, end)) = token.split_once('-') {
+            if let (Ok(a), Ok(b)) = (start.trim().parse::<i64>(), end.trim().parse::<i64>()) {
+                let (low, high) = if a <= b { (a, b) } else { (b, a) };
+                for n in low..=high {
+                    expanded.push(n.to_string());
                 }
                 continue;
             }
         }
-        out.push(part.to_string());
+        expanded.push(token.to_string());
     }
-    if out.is_empty() {
-        out.push(raw.to_string());
+
+    if expanded.is_empty() {
+        expanded.push(raw.to_string());
     }
-    out
+
+    expanded
 }
 
-fn parse_op(op: &str) -> Option<Op> {
-    match op.to_lowercase().as_str() {
-        "contains" => Some(Op::Contains),
-        "does not contain" | "not contains" | "not contain" | "!contains" => Some(Op::NotContains),
-        "=" | "==" => Some(Op::Eq),
-        "!=" => Some(Op::Ne),
-        ">" => Some(Op::Gt),
-        "<" => Some(Op::Lt),
-        ">=" => Some(Op::Ge),
-        "<=" => Some(Op::Le),
+fn parse_operator(input: &str) -> Option<Operator> {
+    match input.to_lowercase().as_str() {
+        "contains" => Some(Operator::Contains),
+        "does not contain" | "not contains" | "not contain" | "!contains" => {
+            Some(Operator::NotContains)
+        }
+        "=" | "==" => Some(Operator::Equal),
+        "!=" => Some(Operator::NotEqual),
+        ">" => Some(Operator::GreaterThan),
+        "<" => Some(Operator::LessThan),
+        ">=" => Some(Operator::GreaterEqual),
+        "<=" => Some(Operator::LessEqual),
         _ => None,
     }
 }
 
 fn parse_condition(text: &str) -> anyhow::Result<Condition> {
-    // pattern: <col> <op> <val> ; col may be quoted or [bracketed]
-    let re = regex::Regex::new(
-        r#"^\s*(?:"(?P<col>[^"]+)"|\[(?P<bcol>[^\]]+)\]|(?P<ccol>[^\s<>!=]+))\s+(?P<op>>=|<=|>|<|!=|==|=|does\s+not\s+contain|not\s+contains|not\s+contain|!contains|contains)\s+(?P<val>.+?)\s*$"#,
+    let regex = regex::Regex::new(
+        r#"^\s*(?:"(?P<col>[^"]+)"|\[(?P<bcol>[^\]]+)\]|(?P<ucol>[^\s<>!=]+))\s+(?P<op>>=|<=|>|<|!=|==|=|does\s+not\s+contain|not\s+contains|not\s+contain|!contains|contains)\s+(?P<val>.+?)\s*$"#,
     )?;
-    let caps = re
+
+    let caps = regex
         .captures(text)
-        .ok_or_else(|| anyhow::anyhow!("Could not parse condition: '{}'", text))?;
-    let col = caps
+        .ok_or_else(|| anyhow::anyhow!("Invalid condition: '{}'", text))?;
+
+    let column = caps
         .name("col")
         .or_else(|| caps.name("bcol"))
-        .or_else(|| caps.name("ccol"))
+        .or_else(|| caps.name("ucol"))
         .map(|m| m.as_str().trim().to_string())
-        .ok_or_else(|| anyhow::anyhow!("Missing column in condition: '{}'", text))?;
-    let op_str = caps
+        .ok_or_else(|| anyhow::anyhow!("Missing column in '{}'", text))?;
+
+    let operator_str = caps
         .name("op")
-        .ok_or_else(|| anyhow::anyhow!("Missing operator in condition: '{}'", text))?
+        .ok_or_else(|| anyhow::anyhow!("Missing operator in '{}'", text))?
         .as_str();
-    let op = parse_op(op_str).ok_or_else(|| anyhow::anyhow!("Unsupported operator '{}'", op_str))?;
-    let val = caps
+
+    let operator =
+        parse_operator(operator_str).ok_or_else(|| anyhow::anyhow!("Bad operator"))?;
+
+    let value_str = caps
         .name("val")
-        .ok_or_else(|| anyhow::anyhow!("Missing value in condition: '{}'", text))?
+        .ok_or_else(|| anyhow::anyhow!("Missing value in '{}'", text))?
         .as_str();
-    let values = expand_values(val);
-    Ok(Condition { column: col, op, values })
+
+    Ok(Condition {
+        column,
+        operator,
+        values: expand_values(value_str),
+    })
 }
 
 fn parse_filter(text: &str) -> anyhow::Result<Option<Filter>> {
     if text.trim().is_empty() {
         return Ok(None);
     }
+
     let normalized = text.replace('(', " ").replace(')', " ");
     let splitter = regex::Regex::new(r"(?i)\s+(and|or)\s+")?;
 
     let mut conditions = Vec::new();
     let mut connectors = Vec::new();
-    let mut last = 0usize;
+    let mut last_index = 0;
     let bytes = normalized.as_bytes();
-    for mat in splitter.find_iter(&normalized) {
-        let start = mat.start();
-        let end = mat.end();
-        if start > last {
-            let cond_str = std::str::from_utf8(&bytes[last..start])?.trim();
-            if !cond_str.is_empty() {
-                conditions.push(parse_condition(cond_str)?);
+
+    for m in splitter.find_iter(&normalized) {
+        let start = m.start();
+        let end = m.end();
+
+        if start > last_index {
+            let slice = std::str::from_utf8(&bytes[last_index..start])?.trim();
+            if !slice.is_empty() {
+                conditions.push(parse_condition(slice)?);
             }
         }
-        connectors.push(mat.as_str().trim().to_uppercase());
-        last = end;
+
+        connectors.push(m.as_str().trim().to_uppercase());
+        last_index = end;
     }
-    // trailing piece
-    if last < normalized.len() {
-        let cond_str = normalized[last..].trim();
-        if !cond_str.is_empty() {
-            conditions.push(parse_condition(cond_str)?);
+
+    if last_index < normalized.len() {
+        let tail = normalized[last_index..].trim();
+        if !tail.is_empty() {
+            conditions.push(parse_condition(tail)?);
         }
     }
 
-    if conditions.is_empty() {
-        return Ok(None);
-    }
     if conditions.len() > 1 && connectors.len() != conditions.len() - 1 {
-        return Err(anyhow::anyhow!("Malformed filter: check AND/OR spacing"));
+        anyhow::bail!("Malformed filter expression");
     }
-    Ok(Some(Filter { conditions, connectors }))
+
+    Ok(Some(Filter {
+        conditions,
+        connectors,
+    }))
 }
 
-fn value_matches(op: &Op, record_val: &str, cond_vals: &[String]) -> bool {
-    let to_num = |s: &str| s.parse::<f64>().ok();
-    match op {
-        Op::Contains => cond_vals.iter().any(|v| record_val.contains(v)),
-        Op::NotContains => cond_vals.iter().all(|v| !record_val.contains(v)),
-        Op::Eq => cond_vals.iter().any(|v| record_val == v),
-        Op::Ne => cond_vals.iter().all(|v| record_val != v),
-        Op::Gt => cond_vals.iter().any(|v| match (to_num(record_val), to_num(v)) {
+fn compare_value(operator: &Operator, record_value: &str, values: &[String]) -> bool {
+    let to_number = |s: &str| s.parse::<f64>().ok();
+
+    match operator {
+        Operator::Contains => values.iter().any(|v| record_value.contains(v)),
+        Operator::NotContains => values.iter().all(|v| !record_value.contains(v)),
+        Operator::Equal => values.iter().any(|v| record_value == v),
+        Operator::NotEqual => values.iter().all(|v| record_value != v),
+        Operator::GreaterThan => values.iter().any(|v| match (to_number(record_value), to_number(v))
+        {
             (Some(a), Some(b)) => a > b,
-            _ => record_val > v.as_str(),
+            _ => record_value > v,
         }),
-        Op::Lt => cond_vals.iter().any(|v| match (to_num(record_val), to_num(v)) {
+        Operator::LessThan => values.iter().any(|v| match (to_number(record_value), to_number(v)) {
             (Some(a), Some(b)) => a < b,
-            _ => record_val < v.as_str(),
+            _ => record_value < v,
         }),
-        Op::Ge => cond_vals.iter().any(|v| match (to_num(record_val), to_num(v)) {
-            (Some(a), Some(b)) => a >= b,
-            _ => record_val >= v.as_str(),
-        }),
-        Op::Le => cond_vals.iter().any(|v| match (to_num(record_val), to_num(v)) {
+        Operator::GreaterEqual => {
+            values.iter().any(|v| match (to_number(record_value), to_number(v)) {
+                (Some(a), Some(b)) => a >= b,
+                _ => record_value >= v,
+            })
+        }
+        Operator::LessEqual => values.iter().any(|v| match (to_number(record_value), to_number(v))
+        {
             (Some(a), Some(b)) => a <= b,
-            _ => record_val <= v.as_str(),
+            _ => record_value <= v,
         }),
     }
 }
 
-fn record_matches(filter: &Filter, headers: &HashMap<String, usize>, record: &StringRecord) -> bool {
-    let eval_condition = |cond: &Condition| -> bool {
-        if cond.column == "*" {
-            // any column
-            let mut matched_any = matches!(cond.op, Op::NotContains | Op::Ne | Op::Le | Op::Lt);
-            for val in record.iter() {
-                let s = val;
-                match cond.op {
-                    Op::NotContains => {
-                        if cond.values.iter().any(|v| s.contains(v)) {
-                            matched_any = false;
-                            break;
-                        } else {
-                            matched_any = true;
-                        }
-                    }
-                    Op::Ne => {
-                        if cond.values.iter().any(|v| s == v) {
-                            matched_any = false;
-                            break;
-                        } else {
-                            matched_any = true;
-                        }
-                    }
-                    Op::Contains | Op::Eq | Op::Gt | Op::Lt | Op::Ge | Op::Le => {
-                        if value_matches(&cond.op, s, &cond.values) {
-                            matched_any = true;
-                            break;
-                        }
-                    }
+fn record_matches_filter(
+    filter: &Filter,
+    header_index: &HashMap<String, usize>,
+    record: &StringRecord,
+    pdir: Option<&str>,
+) -> bool {
+    let evaluate = |condition: &Condition| -> bool {
+        if condition.column == "*" {
+            let mut matched = matches!(
+                condition.operator,
+                Operator::NotContains | Operator::NotEqual | Operator::LessThan | Operator::LessEqual
+            );
+
+            for field in record.iter() {
+                if compare_value(&condition.operator, field, &condition.values) {
+                    matched = true;
+                    break;
                 }
             }
-            matched_any
-        } else if let Some(idx) = headers.get(&cond.column) {
-            let val = record.get(*idx).unwrap_or_default();
-            value_matches(&cond.op, val, &cond.values)
+            matched
+        } else if condition.column == "PDIR" {
+            compare_value(
+                &condition.operator,
+                pdir.unwrap_or_default(),
+                &condition.values,
+            )
+        } else if let Some(index) = header_index.get(&condition.column) {
+            compare_value(
+                &condition.operator,
+                record.get(*index).unwrap_or_default(),
+                &condition.values,
+            )
         } else {
-            // missing column => treat as empty string
-            value_matches(&cond.op, "", &cond.values)
+            compare_value(&condition.operator, "", &condition.values)
         }
     };
 
-    let mut result = eval_condition(&filter.conditions[0]);
-    for (i, conn) in filter.connectors.iter().enumerate() {
-        let next = eval_condition(&filter.conditions[i + 1]);
-        if conn == "AND" {
-            result = result && next;
+    let mut result = evaluate(&filter.conditions[0]);
+
+    for (i, connector) in filter.connectors.iter().enumerate() {
+        let next = evaluate(&filter.conditions[i + 1]);
+        result = if connector == "AND" {
+            result && next
         } else {
-            result = result || next;
-        }
+            result || next
+        };
     }
+
     result
 }
 
-fn collect_headers(files: &[PathBuf]) -> anyhow::Result<Vec<String>> {
-    let mut set: HashSet<String> = HashSet::new();
-    for path in files {
-        let mut rdr = ReaderBuilder::new().has_headers(true).from_path(path)?;
-        if let Some(headers) = rdr.headers().ok() {
-            for h in headers.iter() {
-                let h = h.to_string();
+fn collect_all_headers(files: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+    let mut headers = HashSet::new();
+
+    for file in files {
+        let mut reader = ReaderBuilder::new().has_headers(true).from_path(file)?;
+        if let Ok(hdrs) = reader.headers() {
+            for h in hdrs {
                 if !h.is_empty() {
-                    set.insert(h);
+                    headers.insert(h.to_string());
                 }
             }
         }
     }
-    let mut cols: Vec<String> = set.into_iter().collect();
-    cols.sort();
-    Ok(cols)
+
+    let mut result: Vec<String> = headers.into_iter().collect();
+    result.sort();
+
+    if !result.iter().any(|h| h == "PDIR") {
+        result.push("PDIR".to_string());
+    }
+
+    Ok(result)
 }
 
-fn ensure_output_path(output: &Path) -> anyhow::Result<PathBuf> {
-    if output.extension().and_then(|s| s.to_str()) == Some("csv") {
-        if let Some(parent) = output.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+fn resolve_output_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.extension().and_then(|s| s.to_str()) == Some("csv") {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        Ok(output.to_path_buf())
+        Ok(path.to_path_buf())
     } else {
-        // treat as directory
-        std::fs::create_dir_all(output)?;
-        let ts = chrono::Local::now().format("output_%Y%m%d_%H%M%S.csv");
-        Ok(output.join(ts.to_string()))
+        std::fs::create_dir_all(path)?;
+        let filename = chrono::Local::now().format("output_%Y%m%d_%H%M%S.csv");
+        Ok(path.join(filename.to_string()))
     }
+}
+
+fn build_pdir_value(file: &Path, root: &Path) -> String {
+    let relative = file.strip_prefix(root).unwrap_or(file);
+    relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let globset = build_globset(&cli.patterns)?;
-    let files = find_files(&cli.input, &globset);
+    let args = CliArgs::parse();
+
+    let globset = build_globset(&args.patterns)?;
+    let files = discover_files(&args.input, &globset);
+
     if files.is_empty() {
-        anyhow::bail!("No CSV files found under {:?} for patterns {:?}", cli.input, cli.patterns);
+        anyhow::bail!("No CSV files found");
     }
 
-    let filter = parse_filter(&cli.filter)?;
-    let headers = collect_headers(&files)?;
-    if headers.is_empty() {
-        anyhow::bail!("No headers detected.");
-    }
+    let filter = parse_filter(&args.filter)?;
+    let headers = collect_all_headers(&files)?;
+    let output_path = resolve_output_path(&args.output)?;
 
-    let out_path = ensure_output_path(&cli.output)?;
-    let need_header = !out_path.exists();
-    let out_file = File::options()
-        .create(true)
-        .append(true)
-        .write(true)
-        .open(&out_path)?;
+    let needs_header = !output_path.exists();
+    let file = File::options().create(true).append(true).open(&output_path)?;
     let mut writer = WriterBuilder::new()
-        .has_headers(need_header)
-        .from_writer(BufWriter::new(out_file));
-    if need_header {
+        .has_headers(needs_header)
+        .from_writer(BufWriter::new(file));
+
+    if needs_header {
         writer.write_record(&headers)?;
     }
 
     let (tx, rx) = mpsc::channel::<Vec<Vec<String>>>();
-    let writer_handle = thread::spawn(move || -> anyhow::Result<usize> {
-        let mut count = 0usize;
+
+    let writer_thread = thread::spawn(move || -> anyhow::Result<usize> {
+        let mut count = 0;
         for batch in rx {
             for row in batch {
                 writer.write_record(&row)?;
@@ -359,61 +363,80 @@ fn main() -> anyhow::Result<()> {
         Ok(count)
     });
 
-    let cores = std::thread::available_parallelism()
+    let available_threads = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1);
-    let max_threads = cores.saturating_sub(4).max(1).min(files.len().max(1));
+        .unwrap_or(1)
+        .saturating_sub(4)
+        .max(1);
 
     ThreadPoolBuilder::new()
-        .num_threads(max_threads)
+        .num_threads(available_threads)
         .build()?
-        .scope(|s| {
+        .scope(|scope| {
             for path in files {
                 let tx = tx.clone();
                 let headers = headers.clone();
                 let filter = filter.clone();
-                s.spawn(move |_| {
-                    let mut batch = Vec::new();
-                    if let Ok(mut rdr) = ReaderBuilder::new().has_headers(true).from_path(&path) {
-                        let header_map: HashMap<String, usize> = match rdr.headers() {
-                            Ok(h) => h
-                                .iter()
-                                .enumerate()
-                                .map(|(i, h)| (h.to_string(), i))
-                                .collect(),
-                            Err(_) => HashMap::new(),
-                        };
-                        for rec in rdr.records().flatten() {
-                            let passes = filter
+                let root = args.input.clone();
+
+                scope.spawn(move |_| {
+                    let mut rows = Vec::new();
+
+                    if let Ok(mut reader) =
+                        ReaderBuilder::new().has_headers(true).from_path(&path)
+                    {
+                        let header_map = reader
+                            .headers()
+                            .map(|h| {
+                                h.iter()
+                                    .enumerate()
+                                    .map(|(i, name)| (name.to_string(), i))
+                                    .collect::<HashMap<_, _>>()
+                            })
+                            .unwrap_or_default();
+
+                        let pdir = build_pdir_value(&path, &root);
+
+                        for record in reader.records().flatten() {
+                            let allowed = filter
                                 .as_ref()
-                                .map(|f| record_matches(f, &header_map, &rec))
+                                .map(|f| record_matches_filter(f, &header_map, &record, Some(&pdir)))
                                 .unwrap_or(true);
-                            if !passes {
+
+                            if !allowed {
                                 continue;
                             }
-                            let mut out_row = Vec::with_capacity(headers.len());
-                            for h in &headers {
-                                if let Some(idx) = header_map.get(h) {
-                                    out_row.push(rec.get(*idx).unwrap_or_default().to_string());
-                                } else {
-                                    out_row.push(String::new());
-                                }
-                            }
-                            batch.push(out_row);
+
+                            let row = headers
+                                .iter()
+                                .map(|h| {
+                                    if h == "PDIR" {
+                                        pdir.clone()
+                                    } else if let Some(i) = header_map.get(h) {
+                                        record.get(*i).unwrap_or_default().to_string()
+                                    } else {
+                                        String::new()
+                                    }
+                                })
+                                .collect();
+
+                            rows.push(row);
                         }
                     }
-                    let _ = tx.send(batch);
+
+                    let _ = tx.send(rows);
                 });
             }
         });
+
     drop(tx);
 
-    let total_rows = writer_handle.join().unwrap_or(Ok(0))?;
+    let written = writer_thread.join().unwrap_or(Ok(0))?;
     eprintln!(
-        "Done. Rows written: {} -> {} (threads used: {})",
-        total_rows,
-        out_path.display(),
-        max_threads
+        "Done. Rows written: {} → {}",
+        written,
+        output_path.display()
     );
+
     Ok(())
 }
